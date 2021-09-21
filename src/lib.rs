@@ -23,13 +23,14 @@ mod tests {
         let q = array![0.0,1.0,0.0];
         assert!(quaternion_length(q.view()) - 1.0 <= 0.00000000001)
     }
+
     #[test]
     fn cross() {
         let q = array![1.0, 2.0, 3.0];
         let u = array![1.0, 5.0, 12.0];
         let c = cross_product(q.view(), u.view());
         let dif = c - array![9.0, -9.0, 3.0];
-        assert!(dif.dot(&dif).abs() <=0.00001);
+        assert!(dif.dot(&dif).abs() <= 0.00001);
     }
 
     #[test]
@@ -38,11 +39,71 @@ mod tests {
         let q = array![0.25,0.25,0.0,0.0];
         let q = normalize_quaternion(q.view());
         let expected = array![2.9999999999999996, 2.0, -4.999999999999999];
-        let dif = rotate_vec_by_quat(v.view(), q.view())-expected;
+        let dif = rotate_vec_by_quat(v.view(), q.view()) - expected;
         let len_dif = dif.dot(&dif).abs();
         assert!(len_dif <= 0.0000000001);
     }
 
+    #[test]
+    fn cost_tester() {
+        //this test depends on the implementation of the cost. If the cost is calculated in another
+        //way, the test should be redone
+        let input = ndarray::arr2(&[[1.0, 2.0, 3.0], [12.0, 3.0, -90.0], [-80.0, 12.0, 3.0]]);
+        let qd = array![0.25,0.25,0.0,0.0,0.0,0.0,0.0];
+        let qd = normalize_qd(qd.view());
+        let output = ndarray::arr2(&[[13.0, 25.0, 31.0], [199.0, 23.0, -9.0], [9.0, 12.0, 4.0]]);
+        assert!(calculate_cost(&qd, input.view(), output.view()) - 242.30765567765292 <= 0.000000000000001)
+    }
+
+    fn generate_optimiz_test_data(qd: VecfView, size: usize, scale: f64) -> (Matx, Matx) {
+        let q = qd.slice(s![..4]);
+        let d = qd.slice(s![4..]);
+        let mut initial_vecs: Matx = ndarray::Array::zeros((size, 3));
+        let mut rng = thread_rng();
+
+        for mut row in initial_vecs.rows_mut() {
+            row[0] = scale * rng.gen::<f64>();
+            row[1] = scale * rng.gen::<f64>();
+            row[2] = scale * rng.gen::<f64>();
+        }
+        let mut output_vecs: Matx = initial_vecs.to_owned();
+        for mut row in output_vecs.rows_mut() {
+            let new_row = rotate_vec_by_quat(row.view(), q.view()) + d.view();
+            row[0] = new_row[0] + rng.gen::<f64>();
+            row[1] = new_row[1] + rng.gen::<f64>();
+            row[2] = new_row[2] + rng.gen::<f64>();
+        }
+        (initial_vecs, output_vecs)
+    }
+
+    #[test]
+    fn bfgs() {
+        let quat = array![0.0, 0.0, 0.25, 1.0, 0.0, 0.0, 0.0];
+        println!("qd before normalization {}", quat);
+        let quat = normalize_qd(quat.view()).to_owned();
+        println!("qd after normalization {}", quat);
+
+        let size = 300 as usize;
+        let scale = 100.0;
+
+        println!("Starting test data generation");
+        let now = Instant::now();
+        let (inv, outv) = generate_optimiz_test_data(quat.view(), size, scale);
+        println!("Data generation over, time taken: {} ms", now.elapsed().as_millis());
+
+        let guess = array![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+        let guess = normalize_qd(guess.view());
+
+
+        println!("Starting Optimization");
+        let now = Instant::now();
+        let res = run_bfgs(inv, outv, guess).unwrap();
+        println!("Optimization over, time taken {} ms", now.elapsed().as_millis());
+        println!("{:#?}", res);
+        println!("\n\n========================================\n\nFinal results: \
+    \nExpected: {} \n\nCalculated: {}", quat, res.param);
+        assert!((quat[3] - res.param[3]).abs() <= 0.1)
+    }
 }
 
 
@@ -75,3 +136,82 @@ fn rotate_vec_by_quat(v: VecfView, q: VecfView) -> Vecf {
     2.0 * u.dot(&v) * &u + (s * s - u.dot(&u)) * &v + 2.0 * s * cross_product(u, v)
 }
 
+fn calculate_cost(qd: &Vecf, initial_vecs: MatxfView, target_vecs: MatxfView) -> f64 {
+    let q = qd.slice(s![..4]);
+    let d = qd.slice(s![4..]);
+    let mut cost = 10.0 * quaternion_length(q.view()); //Normalization constraint
+    for i in 0..initial_vecs.shape()[0] {
+        let res = rotate_vec_by_quat(initial_vecs.row(i).view(), q.view())
+            + d.view() - target_vecs.row(i).view();
+        cost += res.dot(&res);
+    }
+    cost.sqrt()
+}
+
+#[derive(Debug)]
+struct QDProblem {
+    input_vectors: Matx,
+    output_vectors: Matx,
+}
+
+
+impl ArgminOp for QDProblem {
+    type Param = Vecf;
+    type Output = f64;
+    type Hessian = Matx;
+    type Jacobian = ();
+    type Float = f64;
+
+    fn apply(&self, _param: &Self::Param) -> Result<Self::Output, Error> {
+        Ok(calculate_cost(&_param, self.input_vectors.view(),
+                          self.output_vectors.view()))
+    }
+
+    fn gradient(&self, _param: &Self::Param) -> Result<Self::Param, Error> {
+        // Ok((*p).forward_diff(&|x| rosenbrock(&x.to_vec(), self.a, self.b)))
+        Ok(
+            (*_param).forward_diff(
+                &|x| calculate_cost(&x, self.input_vectors.view(),
+                                    self.output_vectors.view()))
+        )
+    }
+}
+
+
+impl QDProblem {
+    pub fn new_qd_finder(input_vectors: Matx, output_vectors: Matx) -> QDProblem {
+        QDProblem {
+            input_vectors,
+            output_vectors,
+        }
+    }
+}
+
+fn run_bfgs(input_vectors: Matx, target_vectors: Matx, qd_guess: Vecf)
+            -> Result<IterState<QDProblem>, Error> {
+    let cost = QDProblem::new_qd_finder(input_vectors, target_vectors);
+
+
+    // set up a line search
+    let line_search = MoreThuenteLineSearch::new().c(1e-6, 0.9)?;
+
+    // Set up solver
+    let solver = LBFGS::new(line_search, 12)
+        .with_tol_cost(0.00001);
+
+    // Run solver
+    let res = Executor::new(cost, solver, qd_guess)
+        .add_observer(ArgminSlogLogger::term(), ObserverMode::Always)
+        .max_iters(1000)
+        .run()?;
+
+    Ok(res.state)
+}
+
+/*
+ 1. https://github.com/bedroombuilds/python2rust/tree/main/15_pymod_in_rust/rust/pyo3_monte_carlo_pi
+ 2. Receive arguments as numpy arrays https://github.com/PyO3/rust-numpy
+ 3. Parse
+ 4. run_bfgs()
+ 5. return pyresult
+ */
