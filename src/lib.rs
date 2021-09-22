@@ -1,11 +1,12 @@
-use std::time::Instant;
+use std::process;
 
 use argmin::prelude::*;
 use argmin::solver::linesearch::MoreThuenteLineSearch;
 use argmin::solver::quasinewton::LBFGS;
 use finitediff::*;
 use ndarray::{array, Ix1, Ix2, s};
-use rand::prelude::*;
+use numpy::ToPyArray;
+use pyo3::prelude::*;
 
 type Vecf = ndarray::Array<f64, Ix1>;
 type VecfView<'a> = ndarray::ArrayView<'a, f64, Ix1>;
@@ -16,7 +17,22 @@ type MatxfView<'a> = ndarray::ArrayView<'a, f64, Ix2>;
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
+    use rand::prelude::*;
+
     use crate::*;
+
+    fn normalize_quaternion(q: VecfView) -> Vecf {
+        q.to_owned() / (q.dot(&q)).sqrt()
+    }
+
+    fn normalize_qd(qd: VecfView) -> Vecf {
+        let q = qd.slice(s![..4]);
+        let d = qd.slice(s![4..]);
+        let q = normalize_quaternion(q);
+        array![q[0], q[1], q[2], q[3], d[0], d[1], d[2]]
+    }
 
     #[test]
     fn length_calculator() {
@@ -97,7 +113,7 @@ mod tests {
 
         println!("Starting Optimization");
         let now = Instant::now();
-        let res = run_bfgs(inv, outv, guess).unwrap();
+        let res = run_bfgs(inv, outv, guess, 100).unwrap();
         println!("Optimization over, time taken {} ms", now.elapsed().as_millis());
         println!("{:#?}", res);
         println!("\n\n========================================\n\nFinal results: \
@@ -118,16 +134,6 @@ fn cross_product(a: VecfView, b: VecfView) -> Vecf {
     (a[0]*b[1]-a[1]*b[0])]
 }
 
-fn normalize_quaternion(q: VecfView) -> Vecf {
-    q.to_owned() / (q.dot(&q)).sqrt()
-}
-
-fn normalize_qd(qd: VecfView) -> Vecf {
-    let q = qd.slice(s![..4]);
-    let d = qd.slice(s![4..]);
-    let q = normalize_quaternion(q);
-    array![q[0], q[1], q[2], q[3], d[0], d[1], d[2]]
-}
 
 fn rotate_vec_by_quat(v: VecfView, q: VecfView) -> Vecf {
     let u = array![q[0], q[1], q[2]];
@@ -171,7 +177,7 @@ impl ArgminOp for QDProblem {
         Ok(
             (*_param).forward_diff(&|x|
                 calculate_cost(&x, self.input_vectors.view(),
-                                    self.output_vectors.view()))
+                               self.output_vectors.view()))
         )
     }
 }
@@ -186,7 +192,7 @@ impl QDProblem {
     }
 }
 
-fn run_bfgs(input_vectors: Matx, target_vectors: Matx, qd_guess: Vecf)
+fn run_bfgs(input_vectors: Matx, target_vectors: Matx, qd_guess: Vecf, max_iter: u64)
             -> Result<IterState<QDProblem>, Error> {
     let cost = QDProblem::new_qd_finder(input_vectors, target_vectors);
 
@@ -201,16 +207,40 @@ fn run_bfgs(input_vectors: Matx, target_vectors: Matx, qd_guess: Vecf)
     // Run solver
     let res = Executor::new(cost, solver, qd_guess)
         .add_observer(ArgminSlogLogger::term(), ObserverMode::Always)
-        .max_iters(1000)
+        .max_iters(max_iter)
         .run()?;
-
     Ok(res.state)
 }
 
-/*
- 1. https://github.com/bedroombuilds/python2rust/tree/main/15_pymod_in_rust/rust/pyo3_monte_carlo_pi
- 2. Receive arguments as numpy arrays https://github.com/PyO3/rust-numpy
- 3. Parse
- 4. run_bfgs()
- 5. return pyresult
- */
+
+#[pymodule]
+// Finds the optimal quaternion and distance that can be used to transform the vectors from the
+// input set to those from the target set. Uses the L-BFGS algorithm and the initial guess should
+// be close enough to the exact result. Avoid q = [0,0,0,0]!!.
+fn quat_optimiz(_py: Python, m: &PyModule) -> PyResult<()> {
+    #[pyfn(m)]
+    #[pyo3(name = "run_optimization")]
+    fn run_optimization_py<'py>(_py: Python<'py>, input_vectors: &numpy::PyArray2<f64>,
+                                target_vectors: &numpy::PyArray2<f64>,
+                                qd_guess: &numpy::PyArray1<f64>,
+                                max_iter: u64) -> &'py numpy::PyArray1<f64>
+    {
+        let input_vectors = unsafe { input_vectors.as_array_mut() };
+        let input_vectors = input_vectors.to_owned();
+        let target_vectors = unsafe { target_vectors.as_array_mut() };
+        let target_vectors = target_vectors.to_owned();
+        let qd_guess = unsafe { qd_guess.as_array_mut() };
+        let qd_guess = qd_guess.to_owned();
+
+        let res = match run_bfgs(input_vectors, target_vectors, qd_guess, max_iter) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("Something went wrong when running the optimization: {}", e);
+                process::exit(1);
+            }
+        };
+        res.param.to_pyarray(_py)
+    }
+
+    Ok(())
+}
