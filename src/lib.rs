@@ -168,10 +168,9 @@ impl ArgminOp for QDProblem {
     }
 
     fn gradient(&self, _param: &Self::Param) -> Result<Self::Param, Error> {
-        // Ok((*p).forward_diff(&|x| rosenbrock(&x.to_vec(), self.a, self.b)))
         Ok(
-            (*_param).forward_diff(
-                &|x| calculate_cost(&x, self.input_vectors.view(),
+            (*_param).forward_diff(&|x|
+                calculate_cost(&x, self.input_vectors.view(),
                                     self.output_vectors.view()))
         )
     }
