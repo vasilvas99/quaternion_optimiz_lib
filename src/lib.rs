@@ -212,9 +212,9 @@ fn run_bfgs(input_vectors: Matx, target_vectors: Matx, qd_guess: Vecf, max_iter:
     Ok(res.state)
 }
 
-// Finds the optimal quaternion and distance that can be used to transform the vectors from the
-// input set to those from the target set. Uses the L-BFGS algorithm and the initial guess should
-// be close enough to the exact result. Avoid q = [0,0,0,0]!!.
+/// Finds the optimal quaternion and distance that can be used to transform the vectors from the
+/// input set to those from the target set. Uses the L-BFGS algorithm and the initial guess should
+/// be close enough to the exact result. Avoid q = [0,0,0,0]!!.
 #[pymodule]
 fn quat_optimiz(_py: Python, m: &PyModule) -> PyResult<()> {
     #[pyfn(m)]
